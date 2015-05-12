@@ -74,6 +74,10 @@
 #include <poll.h>
 #include <stdio.h>
 
+#ifdef __sh__
+#include <linux/dvb/stm_ioctls.h>
+#endif
+
 #include <gst/gst.h>
 #include <gst/audio/audio.h>
 #include <gst/base/gstbasesink.h>
@@ -190,6 +194,36 @@ GST_STATIC_PAD_TEMPLATE(
 	)
 );
 
+#define AUDIO_ENCODING_UNKNOWN  0xFF
+
+unsigned int bypass_to_encoding (unsigned int bypass)
+{
+#ifdef AUDIO_SET_ENCODING
+	switch(bypass)
+	{
+	case AUDIOTYPE_AC3:
+	case AUDIOTYPE_AC3_PLUS:
+		return AUDIO_ENCODING_AC3;
+	case AUDIOTYPE_MPEG:
+		return AUDIO_ENCODING_MPEG1;
+	case AUDIOTYPE_DTS:
+		return AUDIO_ENCODING_DTS;
+	case AUDIOTYPE_LPCM:
+		return AUDIO_ENCODING_LPCMA;
+	case AUDIOTYPE_MP3:
+		return AUDIO_ENCODING_MP3;
+	case AUDIOTYPE_AAC_PLUS:
+		return AUDIO_ENCODING_AAC;
+	case AUDIOTYPE_WMA:
+	case AUDIOTYPE_WMA_PRO:
+		return AUDIO_ENCODING_WMA;
+	default:
+		return AUDIO_ENCODING_UNKNOWN;
+	}
+#endif
+	return AUDIO_ENCODING_UNKNOWN;
+}
+
 static void gst_dvbaudiosink_init(GstDVBAudioSink *self);
 
 #define DEBUG_INIT \
@@ -274,6 +308,11 @@ static void gst_dvbaudiosink_init(GstDVBAudioSink *self)
 	self->unlockfd[0] = self->unlockfd[1] = -1;
 	self->rate = 1.0;
 	self->timestamp = GST_CLOCK_TIME_NONE;
+#ifdef AUDIO_SET_ENCODING
+	self->use_set_encoding = TRUE;
+#else
+	self->use_set_encoding = FALSE;
+#endif	
 
 	gst_base_sink_set_sync(GST_BASE_SINK(self), FALSE);
 	gst_base_sink_set_async_enabled(GST_BASE_SINK(self), TRUE);
@@ -699,11 +738,26 @@ static gboolean gst_dvbaudiosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 		if (self->fd >= 0) ioctl(self->fd, AUDIO_STOP, 0);
 		self->playing = FALSE;
 	}
-	if (self->fd < 0 || ioctl(self->fd, AUDIO_SET_BYPASS_MODE, bypass) < 0)
+
+	if (self->use_set_encoding)
 	{
-		GST_ELEMENT_ERROR(self, STREAM, TYPE_NOT_FOUND,(NULL),("hardware decoder can't be set to bypass mode type %s", type));
-		return FALSE;
+#ifdef AUDIO_SET_ENCODING
+		unsigned int encoding = bypass_to_encoding(bypass);
+		if (self->fd < 0 || ioctl(self->fd, AUDIO_SET_ENCODING, encoding) < 0)
+		{
+			GST_ELEMENT_WARNING(self, STREAM, DECODE,(NULL),("hardware decoder can't be set to encoding %i", encoding));
+		}
+#endif
 	}
+	else
+	{
+		if (self->fd < 0 || ioctl(self->fd, AUDIO_SET_BYPASS_MODE, bypass) < 0)
+		{
+			GST_ELEMENT_ERROR(self, STREAM, TYPE_NOT_FOUND,(NULL),("hardware decoder can't be set to bypass mode type %s", type));
+			return FALSE;
+		}
+	}
+
 	if (self->fd >= 0) ioctl(self->fd, AUDIO_PLAY);
 	self->playing = TRUE;
 
@@ -747,6 +801,11 @@ static gboolean gst_dvbaudiosink_event(GstBaseSink *sink, GstEvent *event)
 	{
 		gboolean pass_eos = FALSE;
 		struct pollfd pfd[2];
+
+#ifdef AUDIO_FLUSH
+		ioctl(self->fd, AUDIO_FLUSH, 1/*NONBLOCK*/); //Notify the player that no addionional data will be injected
+#endif
+
 		pfd[0].fd = self->unlockfd[0];
 		pfd[0].events = POLLIN;
 		pfd[1].fd = self->fd;

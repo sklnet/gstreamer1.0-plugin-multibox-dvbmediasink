@@ -114,6 +114,7 @@ struct _GstDVBAudioSink
 	GstBuffer *pesheader_buffer;
 	GstBuffer *codec_data;
 	GstBuffer *cache;
+	gboolean reset_time;
 
 	int fd;
 	int unlockfd[2];
@@ -128,6 +129,7 @@ struct _GstDVBAudioSink
 	gdouble rate;
 	gboolean playing, paused, flushing, unlocking;
 	gboolean pts_written;
+	gboolean flushed, using_dts_downmix;
 	gint64 lastpts;
 	gint64 timestamp_offset;
 	gint8 ok_to_write;

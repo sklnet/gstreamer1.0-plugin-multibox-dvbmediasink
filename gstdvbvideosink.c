@@ -63,15 +63,6 @@
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
-#include <unistd.h>
-#include <stdint.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <linux/dvb/video.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <string.h>
-#include <stdio.h>
 
 #ifdef __sh__
 #include <linux/dvb/stm_ioctls.h>
@@ -168,6 +159,13 @@ GST_DEBUG_CATEGORY_STATIC (dvbvideosink_debug);
 
 enum
 {
+	PROP_0,
+	PROP_SYNC,
+	PROP_LAST,
+};
+
+enum
+{
 	SIGNAL_GET_DECODER_TIME,
 	LAST_SIGNAL
 };
@@ -188,9 +186,15 @@ GST_STATIC_PAD_TEMPLATE (
 	"video/mpeg, "
 		"mpegversion = (int) { 1, 2 }, "
 		VIDEO_CAPS "; "
+#ifdef HAVE_H265
+	"video/x-h265, "
+		VIDEO_CAPS "; "
+#endif
 #ifdef HAVE_H264
 	"video/x-h264, "
 		VIDEO_CAPS "; "
+	"video/x-h264, "
+		"parsed = (boolean)true; "
 #endif
 #ifdef HAVE_H263
 	"video/x-h263, "
@@ -279,6 +283,10 @@ unsigned int streamtype_to_encoding(unsigned int streamtype)
 }
 
 static void gst_dvbvideosink_init(GstDVBVideoSink *self);
+static void gst_dvbvideosink_dispose(GObject *obj);
+static void gst_dvbvideosink_reset(GObject *obj);
+static void gst_dvbvideosink_set_property (GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec);
+static void gst_dvbvideosink_get_property (GObject * object, guint prop_id, GValue * value, GParamSpec * pspec);
 
 #define DEBUG_INIT \
 	GST_DEBUG_CATEGORY_INIT(dvbvideosink_debug, "dvbvideosink", 0, "dvbvideosink element");
@@ -304,6 +312,8 @@ static void gst_dvbvideosink_class_init(GstDVBVideoSinkClass *self)
 	GstElementClass *element_class = GST_ELEMENT_CLASS (self);
 
 	parent_class = g_type_class_peek_parent(self);
+	gobject_class->finalize = gst_dvbvideosink_reset;
+	gobject_class->dispose = gst_dvbvideosink_dispose;
 
 	gst_element_class_add_pad_template(element_class, gst_static_pad_template_get(&sink_factory));
 	gst_element_class_set_static_metadata(element_class,
@@ -311,6 +321,13 @@ static void gst_dvbvideosink_class_init(GstDVBVideoSinkClass *self)
 		"Generic/DVBVideoSink",
 		"Outputs PES into a linuxtv dvb video device",
 		"PLi team");
+
+	gobject_class->set_property = gst_dvbvideosink_set_property;
+	gobject_class->get_property = gst_dvbvideosink_get_property;
+
+	g_object_class_install_property (gobject_class, PROP_SYNC,
+			g_param_spec_boolean ("sync", "Sync", "Sync on the clock", FALSE,
+					G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
 	gstbasesink_class->start = GST_DEBUG_FUNCPTR (gst_dvbvideosink_start);
 	gstbasesink_class->stop = GST_DEBUG_FUNCPTR (gst_dvbvideosink_stop);
@@ -354,7 +371,7 @@ static void gst_dvbvideosink_init(GstDVBVideoSink *self)
 #endif
 	self->use_dts = FALSE;
 	self->paused = self->playing = self->unlocking = self->flushing = FALSE;
-	self->pts_written = FALSE;
+	self->pts_written = self->using_dts_downmix = FALSE;
 	self->lastpts = 0;
 	self->timestamp_offset = 0;
 	self->queue = NULL;
@@ -372,30 +389,54 @@ static void gst_dvbvideosink_init(GstDVBVideoSink *self)
 	gst_base_sink_set_async_enabled(GST_BASE_SINK(self), TRUE);
 }
 
+static void gst_dvbvideosink_dispose(GObject *obj)
+{
+	G_OBJECT_CLASS(parent_class)->dispose(obj);
+	GST_DEBUG("GstDVBVideoSink DISPOSED");
+}
+
+static void gst_dvbvideosink_reset(GObject *obj)
+{
+	G_OBJECT_CLASS(parent_class)->finalize(obj);
+	GST_DEBUG("GstDVBVideoSink RESET");
+}
+
+static void gst_dvbvideosink_set_property (GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec)
+{
+	GstDVBVideoSink *self = GST_DVBVIDEOSINK(object);
+
+	switch (prop_id)
+	{
+	/* sink should only work with sync turned off, ignore all attempts to change it */
+	case PROP_SYNC:
+		GST_INFO_OBJECT(self, "ignoring attempt to change 'sync' to '%d'", g_value_get_boolean(value));
+		break;
+	default:
+		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+		break;
+	}
+}
+
+static void gst_dvbvideosink_get_property (GObject * object, guint prop_id, GValue * value, GParamSpec * pspec)
+{
+	GstDVBVideoSink *self = GST_DVBVIDEOSINK(object);
+
+	switch (prop_id)
+	{
+	case PROP_SYNC:
+		g_value_set_boolean(value, gst_base_sink_get_sync(GST_BASE_SINK(object)));
+		break;
+	default:
+		G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+		break;
+	}
+}
+
 static gint64 gst_dvbvideosink_get_decoder_time(GstDVBVideoSink *self)
 {
 	gint64 cur = 0;
 	if (self->fd < 0 || !self->playing || !self->pts_written) return GST_CLOCK_TIME_NONE;
-#ifdef DREAMBOX
-	if (self->pts_written)
-	{
-		ioctl(self->fd, VIDEO_GET_PTS, &cur);
-		if (cur)
-		{
-			self->lastpts = cur;
-		}
-		else
-		{
-			cur = self->lastpts;
-		}
-		cur *= 11111;
-		cur -= self->timestamp_offset;
-	}
-	else
-	{
-		cur = 0;
-	}
-#else
+
 	ioctl(self->fd, VIDEO_GET_PTS, &cur);
 	if (cur)
 	{
@@ -407,7 +448,7 @@ static gint64 gst_dvbvideosink_get_decoder_time(GstDVBVideoSink *self)
 	}
 	cur *= 11111;
 	cur -= self->timestamp_offset;
-#endif
+
 	return cur;
 }
 
@@ -438,6 +479,12 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 	switch (GST_EVENT_TYPE (event))
 	{
 	case GST_EVENT_FLUSH_START:
+		if(self->flushed && !self->playing && self->using_dts_downmix)
+		{ 
+			self->playing = TRUE;
+			self->ok_to_write = 1;
+		}
+		self->flushed = FALSE;
 		self->flushing = TRUE;
 		/* wakeup the poll */
 		write(self->unlockfd[1], "\x01", 1);
@@ -454,6 +501,13 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 		self->flushing = FALSE;
 		GST_OBJECT_UNLOCK(self);
 		if(self->paused) ret = GST_BASE_SINK_CLASS(parent_class)->event(sink, event);
+		/* flush while media is playing requires a delay before rendering */
+		if (self->using_dts_downmix)
+		{
+			self->ok_to_write = 0;
+			self->playing = FALSE;
+		}
+		self->flushed = TRUE;
 		break;
 	case GST_EVENT_EOS:
 	{
@@ -509,13 +563,16 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 		GstFormat format;
 		gdouble rate;
 		guint64 start, end, pos;
+		gint64 start_dvb;
 		gst_event_parse_segment(event, &segment);
 		format = segment->format;
 		rate = segment->rate;
 		start = segment->start;
 		end = segment->stop;
 		pos = segment->position;
-		GST_DEBUG_OBJECT(self, "GST_EVENT_NEWSEGMENT rate=%f\n", rate);
+		start_dvb = start / 11111LL;
+		GST_INFO_OBJECT(self, "SEGMENT rate=%f format=%d start=%"G_GUINT64_FORMAT " pos=%"G_GUINT64_FORMAT, rate, format, start, pos);
+		GST_INFO_OBJECT(self, "SEGMENT DVB TIMESTAMP=%"G_GINT64_FORMAT " HEXFORMAT %#"G_GINT64_MODIFIER "x", start_dvb, start_dvb);
 		if (format == GST_FORMAT_TIME)
 		{
 			self->timestamp_offset = start - pos;
@@ -536,18 +593,46 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 				self->rate = rate;
 			}
 		}
+		ret = GST_BASE_SINK_CLASS(parent_class)->event(sink, event);
 		break;
 	}
-	case GST_EVENT_CAPS:
+	case GST_EVENT_TAG:
 	{
-		GstCaps *caps;
-		gst_event_parse_caps(event, &caps);
-		if (caps)
+		GstTagList *taglist;
+		gst_event_parse_tag(event, &taglist);
+		GST_INFO_OBJECT(self,"TAG %"GST_PTR_FORMAT, taglist);
+		ret = GST_BASE_SINK_CLASS(parent_class)->event(sink, event);
+		break;
+	}
+	case GST_EVENT_TOC:
+	{
+		GstToc *toc;
+		gboolean updated;
+		gst_event_parse_toc (event, &toc, &updated);
+		/* get toc entries info if updated */
+		GList *i = NULL;
+		for (i = gst_toc_get_entries(toc); i; i = i->next)
 		{
-            self->must_send_header = TRUE;
-			ret = gst_dvbvideosink_set_caps(sink, caps);
-			gst_caps_unref(caps);
+			GstTocEntry *entry = (GstTocEntry*)(i->data);
+			GST_INFO_OBJECT(self,"Toc entry_type %s", gst_toc_entry_type_get_nick(gst_toc_entry_get_entry_type (entry)));
+			GList *x = NULL;
+			for (x = gst_toc_entry_get_sub_entries (entry); x; x = x->next)
+			{
+				GstTocEntry *sub_entry = (GstTocEntry*)(x->data);
+				GstTagList *tags = gst_toc_entry_get_tags(sub_entry);
+				gint64 start = 0;
+				gint64 stop = 0;
+				gst_toc_entry_get_start_stop_times(sub_entry, &start, &stop);
+				gchar *title;
+				gst_tag_list_get_string (tags, "title", &title);
+				GST_INFO_OBJECT(self,"%s start=%"G_GINT64_FORMAT " stop=%"G_GINT64_FORMAT,
+								 title, start, stop);
+				g_free(title);
+			}
 		}
+		GstTocScope scope = gst_toc_get_scope(toc);
+		GST_INFO_OBJECT(self,"TOC  scope=%d", scope);
+		ret = GST_BASE_SINK_CLASS(parent_class)->event(sink, event);
 		break;
 	}
 	default:
@@ -578,7 +663,7 @@ static int video_write(GstBaseSink *sink, GstDVBVideoSink *self, GstBuffer *buff
 	{
 		if (self->flushing)
 		{
-			GST_DEBUG_OBJECT(self, "flushing, skip %d bytes", len - written);
+			GST_INFO_OBJECT(self, "flushing, skip %d bytes", len - written);
 			break;
 		}
 		else if (self->paused || self->unlocking)
@@ -591,7 +676,7 @@ static int video_write(GstBaseSink *sink, GstDVBVideoSink *self, GstBuffer *buff
 		}
 		else
 		{
-			GST_LOG_OBJECT (self, "going into poll, have %d bytes to write", len - written);
+			GST_DEBUG_OBJECT (self, "going into poll, have %d bytes to write", len - written);
 		}
 		if (poll(pfd, 2, -1) < 0)
 		{
@@ -734,6 +819,16 @@ static GstFlowReturn gst_dvbvideosink_render(GstBaseSink *sink, GstBuffer *buffe
 	{
 		return GST_FLOW_OK;
 	}
+	gint i = 0;
+	/* WAIT 1 seconds after flush needed for enigma2 to be ready*/
+	while (self->ok_to_write == 0)
+	{
+			self->flushed = FALSE;
+			self->ok_to_write = 1;
+			self->playing = TRUE;
+			gst_sleepms(1000);
+			GST_INFO_OBJECT(self,"RESUME PLAY AFTER FLUSH + 1 SECOND");
+	}
 	GstMapInfo map, pesheadermap, codecdatamap;
 	gst_buffer_map(buffer, &map, GST_MAP_READ);
 	original_data = data = map.data;
@@ -872,7 +967,7 @@ static GstFlowReturn gst_dvbvideosink_render(GstBaseSink *sink, GstBuffer *buffe
 					self->must_send_header = FALSE;
 				}
 			}
-			if (self->codec_type == CT_H264)
+			if (self->codec_type == CT_H264 || self->codec_type == CT_H265)
 			{
 				unsigned int pos = 0;
 				if (self->h264_nal_len_size >= 3)
@@ -1244,7 +1339,9 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 	GstDVBVideoSink *self = GST_DVBVIDEOSINK (basesink);
 	GstStructure *structure = gst_caps_get_structure (caps, 0);
 	const char *mimetype = gst_structure_get_name (structure);
+	t_stream_type prev_stream_type = self->stream_type;
 	self->stream_type = STREAMTYPE_UNKNOWN;
+	self->must_send_header = TRUE;
 
 	GST_INFO_OBJECT (self, "caps = %" GST_PTR_FORMAT, caps);
 
@@ -1281,6 +1378,7 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 					fourcc = GST_STR_FOURCC(value);
 				switch (fourcc)
 				{
+					case GST_MAKE_FOURCC('F', 'M', 'P', '4'):
 					case GST_MAKE_FOURCC('R', 'M', 'P', '4'):
 					case GST_MAKE_FOURCC('x', 'v', 'i', 'd'):
 					case GST_MAKE_FOURCC('X', 'V', 'I', 'D'):
@@ -1418,6 +1516,76 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 		}
 		GST_INFO_OBJECT (self, "MIMETYPE video/x-h264 -> STREAMTYPE_MPEG4_H264");
 	}
+	else if (!strcmp (mimetype, "video/x-h265"))
+	{
+		const GValue *cd_data = gst_structure_get_value(structure, "codec_data");
+		self->stream_type = STREAMTYPE_MPEG4_H265;
+		self->codec_type = CT_H265;
+		if (cd_data)
+		{
+			unsigned char tmp[2048];
+			unsigned int tmp_len = 0;
+			GstBuffer *codec_data = gst_value_get_buffer(cd_data);
+			guint8 *data;
+			gsize cd_len;
+			unsigned int cd_pos = 0;
+			GstMapInfo codecdatamap;
+			gst_buffer_map(codec_data, &codecdatamap, GST_MAP_READ);
+			data = codecdatamap.data;
+			cd_len = codecdatamap.size;
+			GST_INFO_OBJECT (self, "H265 have codec data..!");
+
+			if (cd_len > 3 && (data[0] || data[1] || data[2] > 1)) {
+				if (cd_len > 22) {
+					int i;
+					if (data[0] != 0) {
+						GST_ELEMENT_WARNING (self, STREAM, DECODE, ("Unsupported extra data version %d, decoding may fail", data[0]), (NULL));
+					}
+					self->h264_nal_len_size = (data[21] & 3) + 1;
+					int num_param_sets = data[22];
+					int pos = 23;
+					for (i = 0; i < num_param_sets; i++) {
+						int j;
+						if (pos + 3 > cd_len) {
+							GST_ELEMENT_ERROR (self, STREAM, DECODE, ("Buffer underrun in extra header (%d >= %ld)", pos + 3, cd_len), (NULL));
+							break;
+						}
+						// ignore flags + NAL type (1 byte)
+						int nal_count = data[pos + 1] << 8 | data[pos + 2];
+						pos += 3;
+						for (j = 0; j < nal_count; j++) {
+							if (pos + 2 > cd_len) {
+								GST_ELEMENT_ERROR (self, STREAM, DECODE, ("Buffer underrun in extra nal header (%d >= %ld)", pos + 2, cd_len), (NULL));
+								break;
+							}
+							int nal_size = data[pos] << 8 | data[pos + 1];
+							pos += 2;
+							if (pos + nal_size > cd_len) {
+								GST_ELEMENT_ERROR (self, STREAM, DECODE, ("Buffer underrun in extra nal (%d >= %ld)", pos + 2 + nal_size, cd_len), (NULL));
+								break;
+							}
+							memcpy(tmp+tmp_len, "\x00\x00\x00\x01", 4);
+							tmp_len += 4;
+							memcpy(tmp + tmp_len, data + pos, nal_size);
+							tmp_len += nal_size;
+							pos += nal_size;
+						}
+					}
+				}
+				GST_DEBUG ("Assuming packetized data (%d bytes length)", self->h264_nal_len_size);
+				{
+					self->codec_data = gst_buffer_new_and_alloc(tmp_len);
+					gst_buffer_fill(self->codec_data, 0, tmp, tmp_len);
+				}
+			}
+			gst_buffer_unmap(codec_data, &codecdatamap);
+		}
+		else
+		{
+			self->h264_nal_len_size = 0;
+		}
+		GST_INFO_OBJECT (self, "MIMETYPE video/x-h265 -> STREAMTYPE_MPEG4_H265");
+	}
 	else if (!strcmp (mimetype, "video/x-h263"))
 	{
 		self->stream_type = STREAMTYPE_H263;
@@ -1483,15 +1651,12 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 			}
 			break;
 			case 4:
-				self->stream_type = STREAMTYPE_MPEG4_Part2;
-				self->codec_type = CT_MPEG4_PART2;
-				const GValue *codec_data = gst_structure_get_value(structure, "codec_data");
-				if (codec_data)
-				{
-					self->codec_data = gst_value_get_buffer(codec_data);
-					gst_buffer_ref (self->codec_data);
-				}
-				GST_INFO_OBJECT (self, "MIMETYPE video/x-divx vers. 4 -> STREAMTYPE_MPEG4_Part2");
+				self->stream_type = STREAMTYPE_DIVX4;
+				self->codec_type = CT_DIVX4;
+				self->codec_data = gst_buffer_new_and_alloc(12);
+				gst_buffer_fill(self->codec_data, 0, "\x00\x00\x01\xb2\x44\x69\x76\x58\x34\x41\x4e\x44", 12);
+				self->use_dts = TRUE;
+				GST_INFO_OBJECT (self, "MIMETYPE video/x-divx vers. 4 -> STREAMTYPE_DIVX4");
 			break;
 			case 6:
 			case 5:
@@ -1555,12 +1720,12 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 				fclose(f);
 			}
 		}
-		if (self->playing)
+		if (self->playing && self->stream_type != prev_stream_type)
 		{
 			if (self->fd >= 0) ioctl(self->fd, VIDEO_STOP, 0);
 			self->playing = FALSE;
 		}
-		if (self->use_set_encoding)
+		if (!self->playing && (self->fd < 0 || ioctl(self->fd, VIDEO_SET_STREAMTYPE, self->stream_type) < 0))
 		{
 #ifdef VIDEO_SET_ENCODING
 			unsigned int encoding = streamtype_to_encoding(self->stream_type);
@@ -1592,7 +1757,7 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 					gst_buffer_map(gst_value_get_buffer(codec_data), &codecdatamap, GST_MAP_READ);
 					codec_data_pointer = codecdatamap.data;
 					codec_size = codecdatamap.size;
-#if defined(VUPLUS) || defined(DREAMBOX) || defined(DAGS)
+#if defined(DREAMBOX) || defined(DAGS)
 					GstMapInfo map;
 					self->codec_data = gst_buffer_new_and_alloc(8 + codec_size);
 					gst_buffer_map(self->codec_data, &map, GST_MAP_WRITE);
@@ -1609,7 +1774,7 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 					g_free(videocodecdata.data);
 #endif
 					gst_buffer_unmap(gst_value_get_buffer(codec_data), &codecdatamap);
-#if defined(VUPLUS) || defined(DREAMBOX) || defined(DAGS)
+#if defined(DREAMBOX) || defined(DAGS)
 					gst_buffer_unmap(self->codec_data, &map);
 #endif
 				}
@@ -1631,7 +1796,7 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 					if (codec_size > 4) codec_size = 4;
 					gst_structure_get_int(structure, "width", &width);
 					gst_structure_get_int(structure, "height", &height);
-#if defined(VUPLUS) || defined(DREAMBOX) || defined(DAGS)
+#if defined(DREAMBOX) || defined(DAGS)
 					GstMapInfo map;
 					self->codec_data = gst_buffer_new_and_alloc(18 + codec_size);
 					gst_buffer_map(self->codec_data, &map, GST_MAP_WRITE);
@@ -1664,12 +1829,13 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 					g_free(videocodecdata.data);
 #endif
 					gst_buffer_unmap(gst_value_get_buffer(codec_data), &codecdatamap);
-#if defined(VUPLUS) || defined(DREAMBOX) || defined(DAGS)
+#if defined(DREAMBOX) || defined(DAGS)
 					gst_buffer_unmap(self->codec_data, &map);
 #endif
 				}
 			}
-			ioctl(self->fd, VIDEO_PLAY);
+			if (!self->playing)
+				ioctl(self->fd, VIDEO_PLAY);
 		}
 		self->playing = TRUE;
 	}
@@ -1725,7 +1891,7 @@ static gboolean gst_dvbvideosink_stop(GstBaseSink *basesink)
 {
 	GstDVBVideoSink *self = GST_DVBVIDEOSINK(basesink);
 	FILE *f = NULL;
-	GST_DEBUG_OBJECT(self, "stop");
+	GST_INFO_OBJECT(self, "stop");
 	if (self->fd >= 0)
 	{
 		if (self->playing)
@@ -1801,6 +1967,7 @@ static GstStateChangeReturn gst_dvbvideosink_change_state(GstElement *element, G
 	{
 	case GST_STATE_CHANGE_NULL_TO_READY:
 		GST_INFO_OBJECT (self,"GST_STATE_CHANGE_NULL_TO_READY");
+		self->ok_to_write = 1;
 		break;
 	case GST_STATE_CHANGE_READY_TO_PAUSED:
 		GST_INFO_OBJECT (self,"GST_STATE_CHANGE_READY_TO_PAUSED");
@@ -1810,11 +1977,13 @@ static GstStateChangeReturn gst_dvbvideosink_change_state(GstElement *element, G
 			ioctl(self->fd, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_MEMORY);
 			ioctl(self->fd, VIDEO_FREEZE);
 		}
+		if(get_downmix_ready())
+			self->using_dts_downmix = TRUE;
 		break;
 	case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+		GST_INFO_OBJECT (self,"GST_STATE_CHANGE_PAUSED_TO_PLAYING");
 		if (self->fd >= 0) ioctl(self->fd, VIDEO_CONTINUE);
 		self->paused = FALSE;
-		GST_INFO_OBJECT (self,"GST_STATE_CHANGE_PAUSED_TO_PLAYING");
 		break;
 	default:
 		break;
@@ -1867,7 +2036,7 @@ static gboolean plugin_init (GstPlugin *plugin)
 GST_PLUGIN_DEFINE (
 	GST_VERSION_MAJOR,
 	GST_VERSION_MINOR,
-	dvb_video_out,
+	dvbvideosink,
 	"DVB Video Output",
 	plugin_init,
 	VERSION,

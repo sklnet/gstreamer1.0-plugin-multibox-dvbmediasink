@@ -380,9 +380,9 @@ static void gst_dvbvideosink_init(GstDVBVideoSink *self)
 	self->saved_fallback_framerate[0] = 0;
 	self->rate = 1.0;
 #ifdef VIDEO_SET_ENCODING
-	self->use_set_encoding      = TRUE;
+	self->use_set_encoding = TRUE;
 #else
-	self->use_set_encoding      = FALSE;
+	self->use_set_encoding = FALSE;
 #endif
 
 	gst_base_sink_set_sync(GST_BASE_SINK(self), FALSE);
@@ -521,7 +521,6 @@ static gboolean gst_dvbvideosink_event(GstBaseSink *sink, GstEvent *event)
 #ifdef VIDEO_FLUSH
 		ioctl(self->fd, VIDEO_FLUSH, 1/*NONBLOCK*/); //Notify the player that no addionional data will be injected
 #endif
-
 		GST_BASE_SINK_PREROLL_UNLOCK(sink);
 		while (1)
 		{
@@ -1725,11 +1724,11 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 			if (self->fd >= 0) ioctl(self->fd, VIDEO_STOP, 0);
 			self->playing = FALSE;
 		}
-		if (!self->playing && (self->fd < 0 || ioctl(self->fd, VIDEO_SET_STREAMTYPE, self->stream_type) < 0))
+		if (self->use_set_encoding)
 		{
 #ifdef VIDEO_SET_ENCODING
 			unsigned int encoding = streamtype_to_encoding(self->stream_type);
-			if (self->fd < 0 || ioctl(self->fd, VIDEO_SET_ENCODING, encoding) < 0)
+			if (!self->playing && (self->fd < 0 || ioctl(self->fd, VIDEO_SET_ENCODING, encoding) < 0))
 			{
 				GST_ELEMENT_ERROR(self, STREAM, DECODE, (NULL), ("hardware decoder can't be set to encoding %i", encoding));
 			}
@@ -1737,7 +1736,7 @@ static gboolean gst_dvbvideosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 		}
 		else
 		{
-			if (self->fd < 0 || ioctl(self->fd, VIDEO_SET_STREAMTYPE, self->stream_type) < 0)
+			if (!self->playing && (self->fd < 0 || ioctl(self->fd, VIDEO_SET_STREAMTYPE, self->stream_type) < 0))
 			{
 				GST_ELEMENT_ERROR(self, STREAM, CODEC_NOT_FOUND, (NULL), ("hardware decoder can't handle streamtype %i", self->stream_type));
 			}

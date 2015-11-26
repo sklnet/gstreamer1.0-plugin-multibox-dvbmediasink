@@ -321,7 +321,6 @@ static void gst_dvbaudiosink_init(GstDVBAudioSink *self)
 #else
 	self->use_set_encoding = FALSE;
 #endif
-
 #ifdef VUPLUS
 	gst_base_sink_set_sync(GST_BASE_SINK(self), FALSE);
 	gst_base_sink_set_async_enabled(GST_BASE_SINK(self), FALSE);
@@ -760,7 +759,6 @@ static gboolean gst_dvbaudiosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 		if (self->fd >= 0) ioctl(self->fd, AUDIO_STOP, 0);
 		self->playing = FALSE;
 	}
-
 	if (self->use_set_encoding)
 	{
 #ifdef AUDIO_SET_ENCODING
@@ -779,7 +777,6 @@ static gboolean gst_dvbaudiosink_set_caps(GstBaseSink *basesink, GstCaps *caps)
 			return FALSE;
 		}
 	}
-
 	if (self->fd >= 0) ioctl(self->fd, AUDIO_PLAY);
 	self->playing = TRUE;
 
@@ -836,11 +833,9 @@ static gboolean gst_dvbaudiosink_event(GstBaseSink *sink, GstEvent *event)
 	{
 		gboolean pass_eos = FALSE;
 		struct pollfd pfd[2];
-
 #ifdef AUDIO_FLUSH
 		ioctl(self->fd, AUDIO_FLUSH, 1/*NONBLOCK*/); //Notify the player that no addionional data will be injected
 #endif
-
 		pfd[0].fd = self->unlockfd[0];
 		pfd[0].events = POLLIN;
 		pfd[1].fd = self->fd;
@@ -1016,12 +1011,16 @@ static int audio_write(GstDVBAudioSink *self, GstBuffer *buffer, size_t start, s
 		{
 			GST_LOG_OBJECT(self, "going into poll, have %d bytes to write", len - written);
 		}
+#if CHECK_DRAIN
 		if (poll(pfd, 2, -1) < 0)
 		{
 			if (errno == EINTR) continue;
 			retval = -1;
 			break;
 		}
+#else
+		pfd[1].revents = POLLOUT;
+#endif
 		if (pfd[0].revents & POLLIN)
 		{
 			/* read all stop commands */
